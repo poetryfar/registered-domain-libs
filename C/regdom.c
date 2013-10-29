@@ -22,186 +22,199 @@
  *
  */
 
-#include <errno.h>
-#include <limits.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include "regdom.h"
-
-/* data types */
-
-#define ALL    '*'
-#define THIS   '!'
-
-#define CHILDREN_BITS (sizeof(unsigned int)*CHAR_BIT - CHAR_BIT)
-#define CHILDREN_MAX  ((1ul << CHILDREN_BITS) - 1)
-
-struct tldnode
-{
-    unsigned int num_children : CHILDREN_BITS;
-    char attr;    // ALL, THIS, or zero
-    char label[];
-};
-typedef struct tldnode tldnode;
-
-// The subnodes of a tldnode with children are stored in memory locations
-// immediately before the node header.  This allows us to allocate the
-// node header, label, and child vector in one go.
-#define subnodes(tn) ((const tldnode *const *)(tn) - (tn)->num_children)
-#define subnodes_w(tn) ((tldnode **)(tn) - (tn)->num_children)
 
 /* static data */
 
 #include "tld-canon.h"
 
-// Recursively construct a search tree from the string pointed-to by 'dptr'.
-static tldnode *
-parseTldNode(const char **dptr)
+static unsigned int
+decode_offset(const unsigned char *optr, unsigned int len, unsigned int nodelen)
 {
-    tldnode *rv;
-    const char *p = *dptr;
-    const char *name, *nend;
-    unsigned long nchildren;
+    unsigned int offset = 0;
+    if (len == 0)
+        return offset + nodelen + STOP_OFFSET;
 
-    // When we are called, the first thing at '*dptr' will be either
-    // a name token (terminated by one of ',' '(' ')') or one of the
-    // special characters '*' or '!'.
-    if (p[0] == ALL || p[0] == THIS)
+    do
     {
-        // Special characters must be immediately followed by ',' or ')'.
-        // They are not allowed to have subnodes.
-        if (p[1] != ',' && p[1] != ')')
-            abort();
-        rv = malloc(sizeof(tldnode));
-        rv->num_children = 0;
-        rv->attr = p[0];
-
-        *dptr = p + 1; // leave cursor pointing at ',' / ')'
+        // Regardless of how many bits actually fit in an 'unsigned char',
+        // the DFA generator puts 8 bits of the number in each.
+        // (The C standard guarantees at least 8 bits will fit.)
+        offset = offset*256 + *optr;
+        optr++;
     }
-    else
+    while (--len);
+
+    if (offset < STOP_OFFSET)
+        return offset;
+    return offset + nodelen;
+}
+
+static unsigned int
+process_branch(char cs,
+               const unsigned char *restrict dfanode,
+               unsigned int op)
+{
+    unsigned int dwidth = op - OP_BRANCH1 + 1;
+    unsigned int len    = dfanode[1];
+    if (len == 0) abort();
+
+    // Binary search in [dfanode+2, dfanode+2+len-1] for c.
+    unsigned char c = cs;
+    const unsigned char *lo = dfanode + 2;
+    const unsigned char *hi = lo + len - 1;
+    const unsigned char *md;
+    while (hi >= lo)
     {
-        name = p;
-        nend = p = p + strcspn(p, "(),");
-        if (name == nend || *nend == '\0')
-            abort();
-        if (*p == '(')
-        {
-            char *endptr;
-            errno = 0;
-            nchildren = strtoul(p+1, &endptr, 10);
-            if (endptr == p+1 || *endptr != ':' || errno
-                || nchildren > CHILDREN_MAX)
-                abort();
-            p = endptr + 1;
-        }
+        md = lo + (hi-lo)/2;
+        unsigned char d = *md;
+        if (d < c)
+            lo = md + 1;
+        else if (d > c)
+            hi = md - 1;
         else
-            nchildren = 0;
-
-        rv = (tldnode *)((char *)malloc(sizeof(tldnode) +
-                                        nchildren*sizeof(tldnode *) +
-                                        (nend - name + 1))
-                         + nchildren * sizeof(tldnode *));
-
-        rv->num_children = nchildren;
-        rv->attr = '\0';
-        memcpy(rv->label, name, nend - name);
-        rv->label[nend-name] = '\0';
-
-        *dptr = p;
-        for (unsigned long i = 0; i < nchildren; i++)
-        {
-            subnodes_w(rv)[i] = parseTldNode(dptr);
-            if (**dptr != ((i == nchildren-1) ? ')' : ','))
-                abort();
-            (*dptr)++;
-        }
+            goto match;
     }
-    return rv;
+    return STOP_FAIL;
+
+ match:;
+    unsigned int idx    = md - (dfanode + 2);
+    unsigned int delta  = 2 + len + len*dwidth;
+    return decode_offset(dfanode + 2 + len + idx*dwidth, dwidth, delta);
 }
 
-// Read TLD string into fast-lookup data structure
-void *
-loadTldTree(void)
+static unsigned int
+process_literal(const char *cur,
+                const char *head,
+                const unsigned char *restrict dfanode,
+                unsigned int op)
 {
-    const char *data = tldString;
-    void *rv = parseTldNode(&data);
-    // Should have consumed the entire string.
-    if (*data) abort();
-    return rv;
-}
+    unsigned int dwidth = op - OP_LITERAL0;
+    unsigned int len    = dfanode[1];
+    unsigned int delta  = 2;
+    if (len == 0) abort();
 
-static void
-printTldTreeI(const tldnode *node, const char *spacer)
-{
-    if (node->attr)
-        printf("%s%s: %c\n", spacer, node->label, node->attr);
-    else
-        printf("%s%s:\n", spacer, node->label);
-
-    if (node->num_children > 0)
+    do
     {
-        size_t n = strlen(spacer);
-        char nspacer[n+2+1];
-        memcpy(nspacer, spacer, n);
-        nspacer[n]   = ' ';
-        nspacer[n+1] = ' ';
-        nspacer[n+2] = '\0';
+        if (cur == head)
+            return STOP_FAIL;
+        if ((unsigned char)cur[-1] != dfanode[delta])
+            return STOP_FAIL;
 
-        for (unsigned int i = 0; i < node->num_children; i++)
-            printTldTreeI(subnodes(node)[i], nspacer);
+        delta++;
+        cur--;
     }
+    while (--len);
+
+    // if we get here, we have successfully matched the entire op
+    return decode_offset(dfanode+delta, dwidth, delta+dwidth);
 }
 
-void
-printTldTree(const void *node, const char *spacer)
-{
-    if (!spacer)
-        spacer = "";
-    printTldTreeI((const tldnode *) node, spacer);
-}
-
+// Possibly record the current position, CUR, as the current longest match,
+// with type OP. (in *MATCH and *MATCH_TYPE)  HEAD is the beginning of the
+// string.
 static void
-freeTldTreeI(tldnode *node)
+candidate_match(unsigned int op,
+                const char *cur,
+                const char *head,
+                const char **restrict match,
+                unsigned int *restrict match_type)
 {
-    for (unsigned int i = 0; i < node->num_children; i++)
-        freeTldTreeI(subnodes_w(node)[i]);
-    // subnodes(node), by itself, is the pointer originally received from
-    // malloc.
-    free(subnodes_w(node));
-}
+    if (op == STOP_FAIL)
+        return;
 
-void
-freeTldTree(void *root)
-{
-    freeTldTreeI((tldnode *) root);
-}
+    // Regardless of opcode, this cannot be a match if it is in
+    // the middle of a label.
+    if (cur != head && cur[-1] != '.')
+        return;
 
-// linear search for domain (and * if available)
-static const tldnode *
-findTldNode(const tldnode *parent, const char *seg_start, const char *seg_end)
-{
-    const tldnode *allNode = 0;
+    *match = cur;
 
-    for (unsigned int i = 0; i < parent->num_children; i++)
+    switch (op)
     {
-        if (!allNode && subnodes(parent)[i]->attr == ALL)
-            allNode = subnodes(parent)[i];
-        else
-        {
-            size_t m = seg_end - seg_start;
-            size_t n = strlen(subnodes(parent)[i]->label);
-            if (m == n && !memcmp(subnodes(parent)[i]->label, seg_start, n))
-                return subnodes(parent)[i];
-        }
+    case STOP_THIS:
+    case MAYBE_STOP_THIS:
+        *match_type = STOP_THIS;
+        break;
+
+    case STOP_NORMAL:
+    case MAYBE_STOP_NORMAL:
+        *match_type = STOP_NORMAL;
+        break;
+
+    case STOP_ALL:
+    case MAYBE_STOP_ALL:
+        *match_type = STOP_ALL;
+        break;
+
+    default:
+        abort();
     }
-    return allNode;
 }
 
+// MATCH is the longest match, and OP is its type.  Confirm that we
+// have enough labels in total for a match of this type to succeed,
+// then return the registered domain.
 static char *
-getRegisteredDomainDropI(const char *hostname, const tldnode *tree,
-                         int drop_unknown)
+check_match(const char *head, const char *match, unsigned int op)
+{
+    if (match == 0)
+        return 0;
+
+    switch (op)
+    {
+    default:
+        abort();
+
+    case STOP_FAIL:
+        return 0; // no match
+
+    case STOP_ALL:
+        // Two additional labels are required.
+        if (match == head)
+            return 0;
+        if (match[-1] == '.')
+            match -= 2;
+        else if (match[0] != '\0')
+            abort();
+
+        while (match > head && match[-1] != '.')
+            match--;
+
+        // fall through
+
+    case STOP_NORMAL:
+        // One additional label is required.
+        if (match == head)
+            return 0;
+        if (match[-1] == '.')
+            match -= 2;
+        else if (match[0] != '\0')
+            abort();
+
+        while (match > head && match[-1] != '.')
+            match--;
+
+        // fall through
+
+    case STOP_THIS:
+        // No additional labels are required.
+        break;
+    }
+
+    // Converting const char * to char * here is necessary so that the
+    // public API may be applied to both const char * and char * strings
+    // (same logic as applies to many string.h functions).
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+    return (char *)match;
+#pragma GCC diagnostic pop
+}
+
+char *
+getRegisteredDomainDrop(const char *hostname, int drop_unknown)
 {
     // Eliminate some special (always-fail) cases first.
     if (hostname[0] == '.' || hostname[0] == '\0')
@@ -209,71 +222,67 @@ getRegisteredDomainDropI(const char *hostname, const tldnode *tree,
 
     // The registered domain will always be a suffix of the input hostname.
     // Start at the end of the name and work backward.
-    const char *head = hostname;
-    const char *seg_end = hostname + strlen(hostname);
-    const char *seg_start;
+    const char *head  = hostname;
+    const char *cur   = hostname + strlen(hostname);
 
-    if (seg_end[-1] == '.')
-        seg_end--;
-    seg_start = seg_end;
-
-    for (;;) {
-        while (seg_start > head && *seg_start != '.')
-            seg_start--;
-        if (*seg_start == '.')
-            seg_start++;
-
-        // [seg_start, seg_end) is one label.
-        const tldnode *subtree = findTldNode(tree, seg_start, seg_end);
-        if (!subtree
-            || (subtree->num_children == 1
-                && subnodes(subtree)[0]->attr == THIS))
-            // Match found.
-            break;
-
-        if (seg_start == head)
-            // No match, i.e. the input name is too short to be a
-            // registered domain.
-            return 0;
-
-        // Advance to the next label.
-        tree = subtree;
-
-        if (seg_start[-1] != '.')
-            abort();
-        seg_end = seg_start - 1;
-        seg_start = seg_end - 1;
-    }
-
-    // Ensure the stripped domain contains at least two labels.
-    if (!strchr(seg_start, '.'))
+    // If no published rule matches, the official default is "*", i.e.
+    // take the last two labels.  Caller can request that we return
+    // NULL instead.
+    const char *match;
+    unsigned int match_type;
+    if (drop_unknown)
     {
-        if (seg_start == head || drop_unknown)
-            return 0;
-
-        seg_start -= 2;
-        while (seg_start > head && *seg_start != '.')
-            seg_start--;
-        if (*seg_start == '.')
-            seg_start++;
+        match = 0;
+        match_type = STOP_FAIL;
+    }
+    else
+    {
+        match = cur;
+        match_type = STOP_ALL;
     }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-qual"
-    return (char *)seg_start;
-#pragma GCC diagnostic pop
+    const unsigned char *restrict dfanode = tld_dfa;
+    unsigned int delta, op;
+
+    for (;;)
+    {
+        op = *dfanode;
+        if (op & MAYBE_STOP_MASK)
+        {
+            candidate_match(op & MAYBE_STOP_MASK,
+                            cur, head, &match, &match_type);
+            op &= ~MAYBE_STOP_MASK;
+        }
+
+        if (op >= OP_BRANCH1 && op <= OP_BRANCH4)
+        {
+            if (cur == head)
+                break;
+            delta = process_branch(cur[-1], dfanode, op);
+            cur -= 1;
+        }
+        else if (op >= OP_LITERAL0 && op <= OP_LITERAL4)
+        {
+            // process_literal handles being called with cur == head
+            delta = process_literal(cur, head, dfanode, op);
+            cur -= dfanode[1];
+        }
+        else
+            abort();
+
+        if (delta < STOP_OFFSET)
+        {
+            candidate_match(delta, cur, head, &match, &match_type);
+            break;
+        }
+        dfanode += delta - STOP_OFFSET;
+    }
+
+    return check_match(head, match, match_type);
 }
 
 char *
-getRegisteredDomainDrop(const char *hostname, const void *tree,
-                        int drop_unknown)
+getRegisteredDomain(const char *hostname)
 {
-    return getRegisteredDomainDropI(hostname, (const tldnode *) tree,
-                                    drop_unknown);
-}
-
-char *
-getRegisteredDomain(const char *hostname, const void *tree)
-{
-    return getRegisteredDomainDropI(hostname, (const tldnode *) tree, 0);
+    return getRegisteredDomainDrop(hostname, 0);
 }

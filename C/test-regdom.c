@@ -34,52 +34,39 @@ main(int argc, char **argv)
         fprintf(stderr, "%s [--drop-unknown] "
                 "<(fully-qualified-domain-name )+>\n",
                 argv[0]);
-        fprintf(stderr, "%s --dump\n",
-                argv[0]);
         return 2;
     }
 
-    void *tree = loadTldTree();
     int error = 0;
+    int drop_unknown = 0;
+    int i = 1;
+    char *result;
 
-    if (!strcmp(argv[1], "--dump"))
-        printTldTree(tree, "");
-    else
+    if (!strcmp(argv[1], "--drop-unknown"))
     {
-        int drop_unknown = 0;
-        int i = 1;
-        char *result;
-
-        if (!strcmp(argv[1], "--drop-unknown"))
-        {
-            i++;
-            drop_unknown = 1;
-        }
-
-        // strip subdomains from every FQDN on the command line
-        for (; i < argc; i++)
-        {
-            // we do it this way so that this test program will call
-            // all of the library interfaces
-            if (drop_unknown)
-                result = getRegisteredDomainDrop(argv[i], tree, 1);
-            else
-                result = getRegisteredDomain(argv[i], tree);
-
-            if (!result)
-            {
-                printf("%s: error\n", argv[i]);
-                error = 1;
-            }
-            else
-                printf("%s: %s\n", argv[i], result);
-        }
+        i++;
+        drop_unknown = 1;
     }
 
-    // This call is not strictly necessary, but, again, we want to make
-    // sure to call all the library interfaces.  Also, it facilitates
-    // running this program under valgrind to make sure the library does
-    // not leak memory when used correctly.
-    freeTldTree(tree);
+    // strip subdomains from every FQDN on the command line
+    for (; i < argc; i++)
+    {
+        // we do it this way so that this test program will call
+        // all of the library interfaces
+        if (drop_unknown)
+            result = getRegisteredDomainDrop(argv[i], 1);
+        else
+            result = getRegisteredDomain(argv[i]);
+
+        if (!result)
+        {
+            printf("%s: error\n", argv[i]);
+            error = 1;
+        }
+        else
+            printf("%s: %s\n", argv[i], result);
+    }
+
+
     return error;
 }

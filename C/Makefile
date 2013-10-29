@@ -3,8 +3,7 @@ CC     = gcc
 CFLAGS = -g -O2 -std=c99 \
 	 -pedantic -Wall -Wextra -Werror -Wwrite-strings \
 	 -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs \
-	 -Wredundant-decls -Wcast-qual -Wcast-align -Winline \
-	 -Wno-unused-parameter -Wno-overlength-strings
+	 -Wredundant-decls -Wcast-qual -Wcast-align -Winline
 
 SOURCES    = test-regdom.c regdom.c regdom.h tld-canon.h
 EXECUTABLE = test-regdom
