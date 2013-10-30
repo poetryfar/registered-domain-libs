@@ -26,9 +26,22 @@
 #include <string.h>
 #include "regdom.h"
 
+#define MATCH_FAIL ((unsigned int)-1)
+
 /* static data */
 
 #include "tld-canon.h"
+
+/* The encoded DFA uses exclusively capital letters; our input may be
+   any case.  (IDNA encoding, however, is caller's responsibility.) */
+static inline unsigned char
+casefold(char cs)
+{
+    unsigned char c = cs;
+    if ('a' <= c && c <= 'z')
+        c = c - 'a' + 'A';
+    return c;
+}
 
 static unsigned int
 decode_offset(const unsigned char *optr, unsigned int len, unsigned int nodelen)
@@ -57,13 +70,13 @@ process_branch(char cs,
                const unsigned char *restrict dfanode,
                unsigned int op)
 {
-    unsigned int dwidth = op - OP_BRANCH1 + 1;
-    unsigned int len    = dfanode[1];
-    if (len == 0) abort();
+    unsigned int dwidth = GET_WIDTH(op);
+    unsigned int len    = GET_LENGTH(op, dfanode[1]);
+    const unsigned char *text = dfanode + GET_TEXT_OFFSET(op);
 
-    // Binary search in [dfanode+2, dfanode+2+len-1] for c.
-    unsigned char c = cs;
-    const unsigned char *lo = dfanode + 2;
+    // Binary search in [text, text+len) for c.
+    unsigned char c = casefold(cs);
+    const unsigned char *lo = text;
     const unsigned char *hi = lo + len - 1;
     const unsigned char *md;
     while (hi >= lo)
@@ -77,12 +90,18 @@ process_branch(char cs,
         else
             goto match;
     }
-    return STOP_FAIL;
+    return MATCH_FAIL;
 
  match:;
-    unsigned int idx    = md - (dfanode + 2);
-    unsigned int delta  = 2 + len + len*dwidth;
-    return decode_offset(dfanode + 2 + len + idx*dwidth, dwidth, delta);
+    unsigned int delta = GET_TEXT_OFFSET(op) + len;
+    if (dwidth == 0)
+        return decode_offset(dfanode + delta, 1, delta + 1);
+    else
+    {
+        unsigned int idx    = md - text;
+        return decode_offset(dfanode + delta + idx*dwidth,
+                             dwidth,   delta + len*dwidth);
+    }
 }
 
 static unsigned int
@@ -91,17 +110,17 @@ process_literal(const char *cur,
                 const unsigned char *restrict dfanode,
                 unsigned int op)
 {
-    unsigned int dwidth = op - OP_LITERAL0;
-    unsigned int len    = dfanode[1];
-    unsigned int delta  = 2;
+    unsigned int dwidth = GET_WIDTH(op);
+    unsigned int len    = GET_LENGTH(op, dfanode[1]);
+    unsigned int delta  = GET_TEXT_OFFSET(op);
     if (len == 0) abort();
 
     do
     {
         if (cur == head)
-            return STOP_FAIL;
-        if ((unsigned char)cur[-1] != dfanode[delta])
-            return STOP_FAIL;
+            return MATCH_FAIL;
+        if (casefold(cur[-1]) != dfanode[delta])
+            return MATCH_FAIL;
 
         delta++;
         cur--;
@@ -122,36 +141,35 @@ candidate_match(unsigned int op,
                 const char **restrict match,
                 unsigned int *restrict match_type)
 {
-    if (op == STOP_FAIL)
+    if (op == MATCH_FAIL)
         return;
 
     // Regardless of opcode, this cannot be a match if it is in
-    // the middle of a label.
+    // the middle of a label.  (No need to casefold here.)
     if (cur != head && cur[-1] != '.')
         return;
 
     *match = cur;
 
-    switch (op)
-    {
-    case STOP_THIS:
-    case MAYBE_STOP_THIS:
-        *match_type = STOP_THIS;
-        break;
+    if (op & TAG_MASK)
+        switch (GET_TAG(op))
+        {
+        case TAG_NORMAL_S: *match_type = STOP_NORMAL; break;
+        case TAG_ALL_S:    *match_type = STOP_ALL;    break;
+        default: abort();
+        }
+    else
+        switch (op)
+        {
+        case STOP_THIS:
+        case STOP_NORMAL:
+        case STOP_ALL:
+            *match_type = op;
+            break;
 
-    case STOP_NORMAL:
-    case MAYBE_STOP_NORMAL:
-        *match_type = STOP_NORMAL;
-        break;
-
-    case STOP_ALL:
-    case MAYBE_STOP_ALL:
-        *match_type = STOP_ALL;
-        break;
-
-    default:
-        abort();
-    }
+        default:
+            abort();
+        }
 }
 
 // MATCH is the longest match, and OP is its type.  Confirm that we
@@ -168,7 +186,7 @@ check_match(const char *head, const char *match, unsigned int op)
     default:
         abort();
 
-    case STOP_FAIL:
+    case MATCH_FAIL:
         return 0; // no match
 
     case STOP_ALL:
@@ -233,7 +251,7 @@ getRegisteredDomainDrop(const char *hostname, int drop_unknown)
     if (drop_unknown)
     {
         match = 0;
-        match_type = STOP_FAIL;
+        match_type = MATCH_FAIL;
     }
     else
     {
@@ -247,28 +265,40 @@ getRegisteredDomainDrop(const char *hostname, int drop_unknown)
     for (;;)
     {
         op = *dfanode;
-        if (op & MAYBE_STOP_MASK)
+        if (GET_TAG(op) == TAG_SPECIAL)
         {
-            candidate_match(op & MAYBE_STOP_MASK,
-                            cur, head, &match, &match_type);
-            op &= ~MAYBE_STOP_MASK;
-        }
+            op &= ~TAG_MASK;
+            if (op == STOP_NORMAL || op == STOP_ALL || op == STOP_THIS)
+            {
+                candidate_match(op, cur, head, &match, &match_type);
+                break;
+            }
+            else if (cur == head || casefold(cur[-1]) != op + 32)
+                break;
 
-        if (op >= OP_BRANCH1 && op <= OP_BRANCH4)
+            dfanode += 1;
+            cur -= 1;
+            continue;
+        }
+        else if (GET_TAG(op) != 0)
+            candidate_match(op, cur, head, &match, &match_type);
+
+        if (GET_OP(op) == OP_BRA)
         {
             if (cur == head)
                 break;
             delta = process_branch(cur[-1], dfanode, op);
             cur -= 1;
         }
-        else if (op >= OP_LITERAL0 && op <= OP_LITERAL4)
+        else
         {
             // process_literal handles being called with cur == head
             delta = process_literal(cur, head, dfanode, op);
-            cur -= dfanode[1];
+            cur -= GET_LENGTH(op, dfanode[1]);
         }
-        else
-            abort();
+
+        if (delta == MATCH_FAIL)
+            break;
 
         if (delta < STOP_OFFSET)
         {

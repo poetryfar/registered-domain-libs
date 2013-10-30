@@ -24,146 +24,266 @@ import numbers
 import os
 import string
 import sys
+import textwrap
+
+VERBOSE = False
 
 #
 # DFA compression and serialization.
 #
 
 class Opcode(object):
-    """Opcodes used in the serialized representation of the DFA.
-       Every state has an opcode, which defines both the operation to
-       perform next, and the sizes of certain fields within the state."""
+    """Low-level serialized representation of the DFA.
+
+       Abstractly, there are two kinds of states: _branch_ states,
+       which make an N-way choice among valid possibilities for the
+       next character, and _literal_ states, which require the next N
+       characters to match a string literal.  (Even more abstractly, a
+       literal state is just an optimized representation of a chain of
+       1-way branch states.)  Furthermore, any state can be tagged
+       with a "stop code", which indicates that the automaton can stop
+       successfully _before_ consuming any characters associated with
+       that state, and the result of the match.
+
+       Both types of state, again abstractly, have three fields in
+       their storage representation:
+
+           opcode | data | out-edges
+
+       The opcode is one or two bytes long; it defines the operation
+       to perform next and the sizes of the 'data' and 'out-edges'
+       fields.  Opcodes have a fairly elaborate format, in order to
+       save space.  "Normal" opcodes are broken into four bitfields:
+
+           bit 76 5 43 210
+               SS O WW LLL
+
+       The S bits are a _stop code_, indicating whether or not the
+       automaton can stop successfully _just before_ processing any
+       characters associated with this state, and if so, with what
+       result.  There are three possibilities for the SS bits:
+
+           00  nonstop
+           01  stop (normal)
+           10  stop (all)
+
+       The fourth possible bit pattern indicates a "special" opcode;
+       see below.
+
+       The O bit indicates whether the state is a branch or a literal:
+
+            0  literal
+            1  branch
+
+       This determines the overall format of the 'data' and
+       'out-edges' fields of the state.  For literal states, 'data' is
+       an ASCII string to match (whose length is set by the L bits,
+       see below) starting from the current position.  Immediately
+       after the data is one out-edge entry, which indicates the
+       next state upon a successful match.  For branch states, 'data'
+       is instead a sorted vector of L characters, any of which is an
+       acceptable match for the very next character, and 'out-edges' is
+       a vector of L out-edge entries, giving the next state for each
+       possibility.  This vector may be compacted as described below.
+
+       The W bits indicate the width of the out-edge entries for this
+       opcode:
+
+           00  compact
+           01  1 byte per entry
+           10  2 bytes per entry
+           11  3 bytes per entry
+
+        The "compact" option's meaning depends on the type of
+        state.  For literal states, it means there is no out-edge
+        field at all; the subsequent state on a successful match
+        immediately follows the end of the data field.  For branch
+        states, it means that there is a _single_ 1-byte out-edge
+        field, which indicates the subsequent state for _any_
+        successful match in this state.  (This happens more often than
+        you'd think.)
+
+        Each out-edge entry is a big-endian, unsigned binary number
+        giving the distance in bytes (within the DFA serialization)
+        from the _end_ of the current state to the _beginning_ of the
+        next one.  However, if the next state is a full stop -- that
+        is, an accepting state with no out-edges of its own -- then
+        it is represented with a special code in the edge vector:
+
+            0   normal
+            1   all
+            2   this
+
+         There is no stop code for a "this" match because "this"
+         matches cannot be a prefix of any other match.  To make space
+         for these special codes, all other out-edge values are 3 +
+         actual displacement.  Note that a compact literal's out-edge
+         field indicates zero _displacement_, not zero as in normal
+         match.
+
+         Finally, the L bits give the length of the data field (and
+         the out-edge field, for non-compact branches).  They form a
+         3-bit unsigned binary number, which is the length minus one
+         for literal states, and the length minus two for branch
+         states (because it doesn't make sense to have zero characters
+         of literal data, or zero or one characters of branch data).
+         If the value is 111, for either type of state, it means that
+         an additional 'length' byte immediately follows; in that case
+         the value in the length byte is the length without any
+         offsets (this means there are some redundant encodings for
+         short lengths, but the gain in simplicity is worth it, and we
+         have plenty of headroom at the high end).
+
+         "Special" opcodes compact an entire state into a single
+         opcode byte.  All special opcodes have their highest two bits
+         set:
+
+             bit 76 54 3210
+                 11 dd dddd
+
+         At present, two types of special opcode are defined:
+
+             * If DDDDDD is 0x0D, 0x0E, 0x10 .. 0x19, or 0x21 .. 0x3A,
+               then this is a hyper-compact literal state, whose text
+               is the single ASCII character DDDDDD + 32, and whose
+               successor state immediately follows.
+
+             * If DDDDDD is 0, 1, or 2, this is a full-stop state
+               whose match type is normal, all, or this, respectively.
+               Normally such states are packed into their
+               predecessors' edge tables, but if a state of this type
+               is the successor for a (hyper-)compact literal state,
+               there is no edge table to pack it into.
+
+          All other special-opcode bit patterns are reserved for
+          future definition.
+    """
 
     # Stop codes, corresponding to the three types of rule.
-    #
-    # Stop codes are packed into the out-edge table of the parent state
-    # rather than being assigned states of their own.  Stop codes are
-    # also recycled to tag words in the input dictionary so that the
-    # DFA construction algorithm does not unify paths where
-    # inappropriate.  Therefore, they must not collide with the valid
-    # set of characters in input words.  Further, to facilitate
-    # packing them into the out-edge table, they should all be
-    # consecutive and at one end of the number space; we use the
-    # bottom end.
-    #
     # The three types of rule receive a rather confusing definition in
     # the spec, but it amounts to the following: if a rule with type X
     # is the longest match for a domain name, then the registered
     # domain is:
-    STOP_FAIL    = 0x00  # error
-    STOP_THIS    = 0x01  # the current match
-    STOP_NORMAL  = 0x02  # the current match plus one label
-    STOP_ALL     = 0x03  # the current match plus two labels
-
-    STOP_OFFSET = 0x04 # subtract this from out-edges >= this to get an offset
+    STOP_NORMAL  = 0x00  # the current match plus one label
+    STOP_ALL     = 0x01  # the current match plus two labels
+    STOP_THIS    = 0x02  # the current match
+    STOP_OFFSET  = 0x03 # subtract this from out-edges >= this to get an offset
 
     # Stop codes can also appear as the high bits of a regular state's
     # opcode.  This happens when one rule is a proper prefix of
-    # another rule.  All such opcodes have the highest bit set, to
-    # avoid collisions with the ASCII printable space (this might not
-    # be necessary, but it appeals to my sense of tidiness).
-    MAYBE_STOP_MASK   = 0xE0
-    MAYBE_STOP_THIS   = 0x80
-    MAYBE_STOP_NORMAL = 0xA0
-    MAYBE_STOP_ALL    = 0xC0
+    # another rule.  It is impossible for this to happen for THIS matches,
+    # so that bit pattern is recycled to tag "special" opcodes.
+    TAG_MASK     = 0xC0
+    TAG_SHIFT    = 6
+    TAG_NONE     = 0x00
+    TAG_NORMAL_S = 0x01
+    TAG_ALL_S    = 0x02
+    TAG_SPECIAL  = 0x03
 
-    # N-way branch.
-    # The state format is
-    #    BRANCHx | n | a b c ... | oa ob oc ... |
-    # The next character is compared with 'a', 'b', 'c' (there are 'n'
-    # possibilities.  If it is equal to one of these characters, advance
-    # to the state indicated by the corresponding 'o' field, otherwise
-    # fail the match.
-    # 'o' fields are either stop codes, or the positive offset from
-    # the end of this state to the next state, plus STOP_OFFSET.  'x'
-    # determines how wide the out edges are: 1, 2, 3, or 4 bytes each.
-    # When out-edges are more than 1 byte wide, they are big-endian.
+    # The next bit down encodes whether this is a "literal" or a
+    # "branch" operation.
+    OP_MASK  = 0x20
+    OP_BRA   = 0x20
+    OP_LIT   = 0x00
 
-    OP_BRANCH1 = 0x04
-    OP_BRANCH2 = 0x05
-    OP_BRANCH3 = 0x06
-    OP_BRANCH4 = 0x07
+    # The next two bits down tell you the width of the displacement
+    # fields in this DFA state.
+    WIDTH_MASK = 0x18
+    WIDTH_SHIFT = 3
 
-    # Literal string match.
-    # The state format is
-    #    LITERALx | n | text | o |
-    # The next 'n' characters are compared with 'text'.  If they
-    # match, advance to state 'o', otherwise fail.
-    # 'o' is encoded as for BRANCHx; as an additional space
-    # optimization there is a LITERAL0 which omits the 'o' field
-    # entirely -- the displacement to the next opcode is zero (from
-    # the end of 'text').  LITERAL->STOP is encoded with LITERAL1 and
-    # the stop code in the 'o' field, rather than LITERAL0 and the
-    # stop code as its own state.
-    OP_LITERAL0 = 0x08
-    OP_LITERAL1 = 0x09
-    OP_LITERAL2 = 0x0A
-    OP_LITERAL3 = 0x0B
-    OP_LITERAL4 = 0x0C
+    # The bottom three bits of an opcode encode the number of jump
+    # table entries (for "branch") or the length of the text (for
+    # "literal").
+    LENGTH_MASK        = 0x07
+    LENGTH_EXTENDED    = 0x07
+
+    LENGTH_OFFSET_LIT  = 1
+    LENGTH_OFFSET_BRA  = 2
+
+    LENGTH_MAX_LIT     = 7
+    LENGTH_MAX_BRA     = 8
 
     @classmethod
-    def encode(cls, main, stop):
-        """Combine a main opcode and a stop code."""
-        if not ( cls.OP_BRANCH1 <= main <= cls.OP_LITERAL4 ):
-            raise RuntimeError("bad main: {!r}".format(main))
-        assert stop is None or cls.STOP_THIS <= stop <= cls.STOP_ALL
-        if stop is None:            return chr(main)
-        elif stop == cls.STOP_THIS:   return chr(main | cls.MAYBE_STOP_THIS)
-        elif stop == cls.STOP_NORMAL: return chr(main | cls.MAYBE_STOP_NORMAL)
-        elif stop == cls.STOP_ALL:    return chr(main | cls.MAYBE_STOP_ALL)
+    def encode_normal(cls, stop, main, width, length):
+        """Encode STOP, MAIN, WIDTH, and LENGTH into a one- or
+           two-byte opcode.  Note that the returned string is backward,
+           because the entire DFA will be reversed when we're done
+           generating it."""
+        if stop is None: stop = 0
+        elif stop == cls.STOP_NORMAL: stop = cls.TAG_NORMAL_S << cls.TAG_SHIFT
+        elif stop == cls.STOP_ALL:    stop = cls.TAG_ALL_S    << cls.TAG_SHIFT
         else:
-            raise RuntimeError("can't get here")
+            raise RuntimeError("bad stop value {!r}".format(stop))
+
+        assert main in (cls.OP_BRA, cls.OP_LIT)
+        assert 0 <= width <= 3
+        if main == cls.OP_BRA:
+            lmax = cls.LENGTH_MAX_BRA
+            loff = cls.LENGTH_OFFSET_BRA
+        else:
+            lmax = cls.LENGTH_MAX_LIT
+            loff = cls.LENGTH_OFFSET_LIT
+
+        opbase = stop | main | (width << cls.WIDTH_SHIFT)
+
+        if length <= lmax:
+            return chr(opbase | (length - loff))
+        else:
+            return chr(length) + chr(opbase | cls.LENGTH_EXTENDED)
+
+    @classmethod
+    def encode_special(cls, value):
+        if isinstance(value, numbers.Number):
+            assert cls.is_stop_code(value)
+            return chr(cls.TAG_SPECIAL << cls.TAG_SHIFT | value)
+        else:
+            assert len(value) == 1
+            if value not in "-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                raise RuntimeError("cannot put {!r} in a hypercompact literal"
+                                   .format(value))
+            return chr(cls.TAG_SPECIAL << cls.TAG_SHIFT | (ord(value) - 32))
 
     @staticmethod
     def encode_offset(delta):
-        """Encode the distance DELTA in the minimum possible number
-           of bytes, and return it.  Note that the string is emitted
-           backward, because the entire DFA will be reversed when
-           we're done generating it."""
+        """Encode the distance DELTA in the minimum possible number of
+           bytes, and return it.  Again, the returned string is backward."""
         if delta < 256:
             return chr(delta)
         elif delta < 256*256:
             return (chr((delta & 0x00FF)     ) +
                     chr((delta & 0xFF00) >> 8))
-        elif delta < 256*256*256:
+        else:
+            assert delta < 256*256*256
             return (chr((delta & 0x0000FF)      ) +
                     chr((delta & 0x00FF00) >>  8) +
                     chr((delta & 0xFF0000) >> 16))
-        else:
-            assert delta < 256*256*256*256
-            return (chr((delta & 0x000000FF)      ) +
-                    chr((delta & 0x0000FF00) >>  8) +
-                    chr((delta & 0x00FF0000) >> 16) +
-                    chr((delta & 0xFF000000) >> 24))
 
     @classmethod
     def enc_lit_offset(cls, to, fro):
         """Encode the absolute distance from FRO to TO (both of which
            are byte counts, with FRO >= TO) in the minimum number of
-           bytes for a LITERAL node. Return an appropriately encoded
-           string and opcode."""
+           bytes for a LITERAL state. Return an appropriately encoded
+           string (yep, backward)."""
         if to == fro:
-            return (cls.OP_LITERAL0, "")
-        encoded = cls.encode_offset(fro - to + cls.STOP_OFFSET)
-        return (cls.OP_LITERAL0 + len(encoded), encoded)
+            return ""
+        return cls.encode_offset(fro - to + cls.STOP_OFFSET)
 
     @classmethod
     def enc_bra_offsets(cls, tos, fro):
         """Encode the distances from FRO to each TO, as above, in the
-           minimum number of bytes for a BRANCH node.  Returns a vector
-           of encoded offsets, padded to the width of the widest.
+           minimum number of bytes for a BRANCH state.  Returns a vector
+           of encoded offsets, padded to the width of the widest.  The
+           strings are all backward, but the vector is *not*.
 
            Some TOs may be strings instead of numbers.  In that case
-           they are assumed to be stop codes, not deltas, and are left
-           intact.
-           """
+           they are assumed to be stop codes, not deltas, and are padded
+           to the necessary width but are otherwise unchanged."""
         encoded = [(cls.encode_offset(fro - to + cls.STOP_OFFSET)
                     if isinstance(to, numbers.Number)
                     else to)
                    for to in tos]
         reqlen = max(len(te) for te in encoded)
-        return (cls.OP_BRANCH1 + reqlen - 1,
-                [te + chr(0)*(reqlen - len(te)) for te in encoded])
+        return [te + chr(0)*(reqlen - len(te)) for te in encoded]
 
     @classmethod
     def emit_opcodes_c(cls, outf):
@@ -173,8 +293,10 @@ class Opcode(object):
             if name[0] not in string.ascii_uppercase: continue
             maxnlen = max(maxnlen, len(name))
             if name.startswith("STOP_"): seq = 0
-            elif name.startswith("MAYBE_"): seq = 1
-            else: seq = 2
+            elif name.startswith("TAG_"): seq = 1
+            elif name.startswith("OP_"): seq = 2
+            elif name.startswith("WIDTH_"): seq = 3
+            else: seq = 4
             opcodes.append((seq, getattr(cls, name), name))
         opcodes.sort()
 
@@ -187,11 +309,23 @@ class Opcode(object):
             outf.write("#define {0:<{1}} 0x{2:02X}\n"
                        .format(name, maxnlen, val))
 
+        outf.write(
+            "\n/* Helpers. */\n\n"
+            "#define GET_TAG(op)    (((op) & TAG_MASK) >> TAG_SHIFT)\n"
+            "#define GET_OP(op)      ((op) & OP_MASK)\n"
+            "#define GET_WIDTH(op)  (((op) & WIDTH_MASK) >> WIDTH_SHIFT)\n"
+            "#define GET_LENGTH(op, len) \\\n"
+            "  (((op) & LENGTH_MASK) == LENGTH_EXTENDED ? (len) : \\\n"
+            "   ((op) & LENGTH_MASK) + ((GET_OP(op) == OP_BRA) \\\n"
+            "                           ? LENGTH_OFFSET_BRA \\\n"
+            "                           : LENGTH_OFFSET_LIT))\n"
+            "#define GET_TEXT_OFFSET(op) \\\n"
+            "  (((op) & LENGTH_MASK) == LENGTH_EXTENDED ? 2 : 1)\n")
+
     @classmethod
     def stop_symbol(cls, code):
         if isinstance(code, str):
             code = ord(code)
-        if code == Opcode.STOP_FAIL:   return "@"
         if code == Opcode.STOP_THIS:   return "!"
         if code == Opcode.STOP_NORMAL: return "+"
         if code == Opcode.STOP_ALL:    return "*"
@@ -202,7 +336,7 @@ class Opcode(object):
         if isinstance(code, str):
             if len(code) > 1: return False
             code = ord(code)
-        return Opcode.STOP_FAIL <= code <= Opcode.STOP_ALL
+        return Opcode.STOP_NORMAL <= code <= Opcode.STOP_THIS
 
 class State(object):
     """One state of the DFA under construction. States are hashable
@@ -218,14 +352,14 @@ class State(object):
        three special values STOP_THIS, STOP_NORMAL, or STOP_ALL.
 
        After the DFA is fully constructed, all epsilon transitions are
-       removed; instead, some nodes reachable by a normal transition
+       removed; instead, some states reachable by a normal transition
        will have a 'stop_code' field which is one of the above special
-       values.  These nodes are maybe-final; they may have out-edges,
+       values.  These states are maybe-final; they may have out-edges,
        in which case they are a *candidate* match, but a longer match
        is still possible.  Or they may have no out-edges, in which
        case they are the longest possible match.
 
-       After removal of epsilon transitions, chains of nodes with
+       After removal of epsilon transitions, chains of states with
        only one in- and out-edge are merged.
        """
 
@@ -304,8 +438,8 @@ class State(object):
                            % repr(word))
 
     def replace_or_register(self, register):
-        """If REGISTER contains a node equivalent to the most recently
-           added child of this node, replace the child with the node in
+        """If REGISTER contains a state equivalent to the most recently
+           added child of this state, replace the child with the state in
            the register."""
 
         if self.last_child is None: return
@@ -324,7 +458,7 @@ class State(object):
     # State-merging optimizations.  Must not be called until the
     # DFA is fully constructed.
 
-    def merge_epsilon_nodes(self):
+    def merge_epsilon_states(self):
         """Recursively merge final states into their parents.
            Whenever we have
                self +---> (final)
@@ -342,7 +476,7 @@ class State(object):
                 del self.o[epsilon]
 
         for child in self.o.values():
-            child.merge_epsilon_nodes()
+            child.merge_epsilon_states()
 
     def find_in_edges(self):
         """Find all of the edges pointing into SELF and its children,
@@ -357,7 +491,7 @@ class State(object):
             child.find_in_edges()
 
     def merge_chains(self):
-        """Recursively merge chains of nodes that perform no branching.
+        """Recursively merge chains of states that perform no branching.
            Whenever we have
                self --a--> child --b--> grand,
            where (a) SELF's only successor is CHILD,
@@ -396,7 +530,7 @@ class State(object):
             child.merge_chains()
 
     def merge_states(self):
-        self.merge_epsilon_nodes()
+        self.merge_epsilon_states()
         self.find_in_edges()
         self.merge_chains()
 
@@ -441,7 +575,7 @@ class State(object):
            traversal below."""
 
         if len(children) == 0:
-            # Terminal node. Don't do anything now; serialize_1 on our
+            # Terminal state. Don't do anything now; serialize_1 on our
             # parent will pack us into the offset table.
             assert self.stop_code is not None
             return
@@ -449,44 +583,66 @@ class State(object):
         end_offset = buf.tell()
 
         if len(children) == 1:
-            # LITERAL node.
+            # LITERAL state.
+            # The state format is
+            #    LITERAL/wl [l] text o
+            # The next 'l' characters are compared with 'text'.
+            # If they match, advance to state 'o', otherwise fail.
+            # LITERAL->STOP is encoded with LITERAL1 and the stop code
+            # in the 'o' field, rather than LITERAL0 and the stop code
+            # as its own state.
             val, child = children[0]
-            assert 0 < len(val) <= 255
             if len(child.o) == 0:
-                assert child.stop_code is not None
-                assert Opcode.STOP_THIS <= child.stop_code <= Opcode.STOP_ALL
-                buf.write(chr(child.stop_code))
-                buf.write("".join(reversed(val)))
-                buf.write(chr(len(val)))
-                buf.write(Opcode.encode(Opcode.OP_LITERAL1, self.stop_code))
+                assert Opcode.is_stop_code(child.stop_code)
+                if len(val) == 1 and self.stop_code is None:
+                    buf.write(Opcode.encode_special(child.stop_code))
+                    buf.write(Opcode.encode_special(val))
+                else:
+                    buf.write(chr(child.stop_code))
+                    buf.write("".join(reversed(val)))
+                    buf.write(Opcode.encode_normal(self.stop_code,
+                                                   Opcode.OP_LIT,
+                                                   1, len(val)))
             else:
                 # How big an offset do we need?
-                (op, enc) = Opcode.enc_lit_offset(child.offset, end_offset)
-                buf.write(enc)
-                buf.write("".join(reversed(val)))
-                buf.write(chr(len(val)))
-                buf.write(Opcode.encode(op, self.stop_code))
+                enc = Opcode.enc_lit_offset(child.offset, end_offset)
+                if len(enc) == 0 and len(val) == 1 and self.stop_code is None:
+                    buf.write(Opcode.encode_special(val))
+                else:
+                    buf.write(enc)
+                    buf.write("".join(reversed(val)))
+                    buf.write(Opcode.encode_normal(self.stop_code,
+                                                   Opcode.OP_LIT,
+                                                   len(enc), len(val)))
         else:
-            # BRANCH node.  Note that 'children' is known to be sorted.
-            assert 2 <= len(children) <= 255
+            # BRANCH state.  Note that 'children' is already sorted.
+            # The state format is
+            #    BRANCH/wl [l] a b c ... oa ob oc ...
+            # The next character is compared with 'a', 'b', 'c', etc.
+            # If it is equal to one of these characters, advance to
+            # the state indicated by the corresponding 'o' field,
+            # otherwise fail the match.
             targets = []
             vals = []
             for v, c in children:
                 assert len(v) == 1
                 vals.append(v)
                 if len(c.o) == 0:
-                    assert c.stop_code is not None
-                    assert Opcode.STOP_THIS <= c.stop_code <= Opcode.STOP_ALL
+                    assert Opcode.is_stop_code(c.stop_code)
                     targets.append(chr(c.stop_code))
                 else:
                     targets.append(c.offset)
-            (op, deltas) = Opcode.enc_bra_offsets(targets, end_offset)
-            vstr = "".join(reversed(vals))
-            dstr = "".join(reversed(deltas))
-            buf.write(dstr)
-            buf.write(vstr)
-            buf.write(chr(len(children)))
-            buf.write(Opcode.encode(op, self.stop_code))
+            deltas = Opcode.enc_bra_offsets(targets, end_offset)
+            if len(deltas[0]) == 1 and len(set(deltas)) == 1:
+                dlen = 0
+                buf.write(deltas[0])
+            else:
+                dlen = len(deltas[0])
+                buf.write("".join(reversed(deltas)))
+
+            buf.write("".join(reversed(vals)))
+            buf.write(Opcode.encode_normal(self.stop_code, Opcode.OP_BRA,
+                                           dlen, len(vals)))
 
         self.offset = buf.tell()
 
@@ -496,7 +652,7 @@ class State(object):
            of every child when it comes time to serialize ourselves. """
 
         if self.offset is not None:
-            # This node (and all its descendants) have already been
+            # This state (and all its descendants) have already been
             # serialized.  Do not do it again.
             return
 
@@ -520,38 +676,47 @@ _to_c_identifier_tr = \
 def to_c_identifier(s):
     return s.upper().translate(_to_c_identifier_tr)
 
-def emit_dfa_c(dfabytes, outf):
+def emit_dfa_c_verbose(dfabytes, outf):
     """Generate a C data object from the DFA in 'dfabytes'.
-       We could just dump it out as a string, but instead we
-       decode it a little and print out each field differently,
-       in order to make the generated DFA easier to debug."""
-
-    outf.write("\nstatic const unsigned char tld_dfa[] = {")
+       In verbose mode, we decode it a little and print out each field
+       differently, in order to make the generated DFA easier to debug."""
 
     state = 0
-    width = 0
-    lit   = False
-    nlen  = 0
-    count = 0
     for idx, byte in enumerate(dfabytes):
         nbyte = ord(byte)
-        if state == 0: # beginning of a node
+        if state == 0: # beginning of a state
             outf.write("\n/* {:04X} */ 0x{:02X},".format(idx, nbyte))
-            op = (nbyte & ~Opcode.MAYBE_STOP_MASK)
-            assert Opcode.OP_BRANCH1 <= op <= Opcode.OP_LITERAL4
-            if op <= Opcode.OP_BRANCH4:
-                lit   = False
-                width = 1 + op - Opcode.OP_BRANCH1
-            else:
-                lit   = True
-                width = op - Opcode.OP_LITERAL0
-            state = 1
 
-        elif state == 1: # length byte
+            if (nbyte & Opcode.TAG_MASK) >> Opcode.TAG_SHIFT \
+                    == Opcode.TAG_SPECIAL:
+                val = nbyte & ~Opcode.TAG_MASK
+                if val <= Opcode.STOP_OFFSET:
+                    outf.write("  /* 0x{:02X} | 0x{:02X} */"
+                               .format(Opcode.TAG_MASK, val))
+                else:
+                    outf.write("  /* 0x{:02X} | '{:s}'-32 */"
+                               .format(Opcode.TAG_MASK, chr(val+32)))
+                continue
+
+            nlen  = 0
+            count = 0
+            lit = (nbyte & Opcode.OP_MASK) != Opcode.OP_BRA
+            width = (nbyte & Opcode.WIDTH_MASK) >> 3
+
+            if (nbyte & Opcode.LENGTH_MASK) != Opcode.LENGTH_EXTENDED:
+                state = 2
+                nlen = (nbyte & Opcode.LENGTH_MASK)
+                if lit:
+                    nlen += Opcode.LENGTH_OFFSET_LIT
+                else:
+                    nlen += Opcode.LENGTH_OFFSET_BRA
+            else:
+                state = 1
+
+        elif state == 1: # extended length byte
             outf.write(" {: 3d},".format(nbyte))
             nlen = nbyte
             state = 2
-            count = 0
 
         elif state == 2: # text
             if count == 0: outf.write(" ")
@@ -559,7 +724,13 @@ def emit_dfa_c(dfabytes, outf):
             count += 1
             if count == nlen:
                 if width == 0:
-                    state = 0
+                    if lit:
+                        state = 0
+                    else:
+                        width = 1
+                        nlen = 1
+                        count = 0
+                        state = 3
                 else:
                     if lit: nlen  = width
                     else:   nlen *= width
@@ -573,7 +744,11 @@ def emit_dfa_c(dfabytes, outf):
             if count == nlen:
                 state = 0
 
-    outf.write("\n};\n")
+def emit_dfa_c(dfabytes, outf):
+    """Same as above, but just dumps the table as a giant blob of numbers."""
+    coded = ", ".join("{:d}".format(ord(c)) for c in dfabytes)
+    outf.write(textwrap.fill(coded, width=78, initial_indent="  ",
+                             subsequent_indent="  ", break_long_words=False))
 
 def emit_mod_c(dfa, input_fname, output_fname, license_text):
     """Write out a complete C header file that defines DFA plus the
@@ -592,15 +767,25 @@ def emit_mod_c(dfa, input_fname, output_fname, license_text):
         outf.write("#ifndef {0}__\n#define {0}__\n"
                    .format(to_c_identifier(os.path.basename(output_fname))))
 
+        outf.write(
+            "\n#if '-' != 45 || '.' != 46 || '0' != 48 || '9' != 57 || \\\n"
+            "    'A' != 65 || 'Z' != 90\n"
+            "#error \"DFA encoding assumes ASCII.\"\n"
+            "#endif\n")
+
         Opcode.emit_opcodes_c(outf)
 
-        #outf.write("\n/* Decision tree is:\n\n     ")
-        #dfa.dump(outf, depth=5)
-        #outf.write("\n*/\n")
+        if VERBOSE:
+            outf.write("\n/* Decision tree is:\n\n     ")
+            dfa.dump(outf, depth=5)
+            outf.write("\n*/\n")
 
-        outf.write("\n/* DFA. */\n")
-
-        emit_dfa_c(dfa.serialize(), outf)
+        outf.write("\nstatic const unsigned char tld_dfa[] = {\n")
+        if VERBOSE:
+            emit_dfa_c_verbose(dfa.serialize(), outf)
+        else:
+            emit_dfa_c(dfa.serialize(), outf)
+        outf.write("\n};\n")
 
         outf.write("\n#endif /* {} */\n".format(os.path.basename(output_fname)))
 
@@ -733,16 +918,16 @@ def read_tld_names(fname):
                 error = True
                 continue
 
-            # Convert to Punycode and force lowercase.
-            # (The IDNA encoder does not apply nameprep to all-ASCII labels.
-            # It is my understanding that the only effect nameprep can have
-            # on an all-ASCII label is to force it to lowercase.)
+            # Convert to Punycode and force lowercase, then check STD3
+            # compliance.
             line = line.decode("utf-8").encode("idna").lower()
             check_std3(fname, lnum, line)
 
             # Input to the DFA-generation algorithm is the *reversal* of the
-            # line, with the rule code appended.
-            domains.append("".join(reversed(line)) + chr(rtype))
+            # line, with the rule code appended, back in uppercase (the
+            # "hypercompact literal" optimization requires uppercase; the
+            # matcher will take care of case insensitivity).
+            domains.append("".join(reversed(line.upper())) + chr(rtype))
 
     if error:
         raise SystemExit(1)
@@ -751,6 +936,11 @@ def read_tld_names(fname):
     return domains, license_text
 
 def main(argv):
+    if argv[1] == "-v" or argv[1] == "--verbose":
+        global VERBOSE
+        VERBOSE = True
+        argv.pop(0)
+
     domains, license_text = read_tld_names(argv[1])
 
     dfa = build_dfa(domains)
